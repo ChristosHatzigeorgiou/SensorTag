@@ -1,5 +1,7 @@
 package chris.sensortag;
 
+import org.apache.http.NameValuePair;
+import android.annotation.TargetApi;
 import android.app.Activity;
 import android.app.ProgressDialog;
 import android.bluetooth.BluetoothAdapter;
@@ -11,8 +13,14 @@ import android.bluetooth.BluetoothGattDescriptor;
 import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
 import android.bluetooth.BluetoothProfile;
+import android.bluetooth.le.BluetoothLeScanner;
+import android.bluetooth.le.ScanCallback;
+import android.bluetooth.le.ScanFilter;
+import android.bluetooth.le.ScanResult;
+import android.bluetooth.le.ScanSettings;
 import android.content.Context;
 import android.content.Intent;
+import android.os.AsyncTask;
 import android.os.Handler;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
@@ -21,16 +29,27 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.AdapterView;
+import android.os.Build;
 import android.widget.BaseAdapter;
 import android.widget.LinearLayout;
 import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.apache.http.message.BasicNameValuePair;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 
 public class MainActivity extends AppCompatActivity {
+
+    private Float tempdata;
+    private Float lightdata;
+    private ProgressDialog pDialog;
+    private static String url = "https://lightningdata.servicebus.windows.net/";
 
     private final static String TAG = MainActivity.class.getSimpleName();
 
@@ -48,6 +67,7 @@ public class MainActivity extends AppCompatActivity {
     private ProgressDialog progressDialog;
 
     private BluetoothAdapter mBluetoothAdapter;
+    private BluetoothLeScanner mLEScanner;
     private final static int REQUEST_ENABLE_BT = 1;
     private boolean mScanning;
     private Handler mHandler;
@@ -55,6 +75,9 @@ public class MainActivity extends AppCompatActivity {
     private static final long SCAN_PERIOD = 10000;
     private LeDeviceListAdapter mLeDeviceListAdapter;
     private BluetoothGatt mBluetoothGatt;
+
+    private ScanSettings settings;
+    private List<ScanFilter> filters;
 
 
     private ListView lv;
@@ -98,6 +121,13 @@ public class MainActivity extends AppCompatActivity {
             Intent enableBtIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
             startActivityForResult(enableBtIntent, REQUEST_ENABLE_BT);
         } else {
+            if (Build.VERSION.SDK_INT >= 21) {
+                mLEScanner = mBluetoothAdapter.getBluetoothLeScanner();
+                settings = new ScanSettings.Builder()
+                        .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                        .build();
+                filters = new ArrayList<>();
+            }
             scanLeDevice(true);
         }
     }
@@ -132,17 +162,27 @@ public class MainActivity extends AppCompatActivity {
             mHandler.postDelayed(new Runnable() {
                 @Override
                 public void run() {
-                    mScanning = false;
-                    mBluetoothAdapter.stopLeScan(mLeScanCallback);
+                    if (Build.VERSION.SDK_INT < 21) {
+                        mBluetoothAdapter.stopLeScan(mLeScanCallback);
+                    } else {
+                        mLEScanner.stopScan(mScanCallback);
+
+                    }
                 }
             }, SCAN_PERIOD);
-
-            mScanning = true;
-            mBluetoothAdapter.startLeScan(mLeScanCallback);
+            if (Build.VERSION.SDK_INT < 21) {
+                mBluetoothAdapter.startLeScan(mLeScanCallback);
+            } else {
+                mLEScanner.startScan(filters, settings, mScanCallback);
+            }
         } else {
-            mScanning = false;
-            mBluetoothAdapter.stopLeScan(mLeScanCallback);
+            if (Build.VERSION.SDK_INT < 21) {
+                mBluetoothAdapter.stopLeScan(mLeScanCallback);
+            } else {
+                mLEScanner.stopScan(mScanCallback);
+            }
         }
+
     }
 
 
@@ -161,6 +201,35 @@ public class MainActivity extends AppCompatActivity {
                     });
                 }
             };
+
+
+    // Scan callback for API >= 21
+    private BTScanCallBack mScanCallback = new BTScanCallBack();
+    @TargetApi(21)
+    private class BTScanCallBack extends ScanCallback {
+        @Override
+        public void onScanResult(int callbackType, final ScanResult result) {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    mLeDeviceListAdapter.addDevice(result.getDevice());
+                    mLeDeviceListAdapter.notifyDataSetChanged();
+                }
+            });
+        }
+
+        @Override
+        public void onBatchScanResults(List<ScanResult> results) {
+            for (ScanResult sr : results) {
+                Log.i("ScanResult - Results", sr.toString());
+            }
+        }
+
+        @Override
+        public void onScanFailed(int errorCode) {
+            Log.e("Scan Failed", "Error Code: " + errorCode);
+        }
+    }
 
 
     // Various callback methods defined by the BLE API.
@@ -250,13 +319,14 @@ public class MainActivity extends AppCompatActivity {
                 public void onCharacteristicWrite (BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
                     if (!doneChars) {
                         // Enable IR temp sensor measurements
-                        BluetoothGattService s = mBluetoothGatt.getService(IR_TEMP_SERVICE);
+                        BluetoothGattService s = gatt.getService(IR_TEMP_SERVICE);
+
                         BluetoothGattCharacteristic c = s.getCharacteristic(IR_TEMP_CONFIG_CHARACTERISTIC);
                         c.setValue(new byte[]{1});
+
                         mBluetoothGatt.writeCharacteristic(c);
                         doneChars = true;
                     }
-
                 }
 
                 @Override
@@ -268,7 +338,10 @@ public class MainActivity extends AppCompatActivity {
                     // If notification from light sensor
                     if (characteristic.getUuid().equals(LIGHT_SENSOR_DATA_CHARACTERISTIC)) {
 
-                        final String s = Double.toString(extractLightSensorData(value));
+                        final double lData = extractLightSensorData(value);
+                        lightdata = (float)lData;
+
+                        final String s = Double.toString(lData);
                         runOnUiThread(new Runnable() {
                             @Override
                             public void run() {
@@ -280,7 +353,10 @@ public class MainActivity extends AppCompatActivity {
                     // If notification from temp sensor
                     } else if (characteristic.getUuid().equals(IR_TEMP_DATA_CHARACTERISTIC)) {
 
-                        final String s = Double.toString(extractAmbientTemperature(value));
+                        final double tData = extractAmbientTemperature(value);
+                        tempdata = (float)tData;
+
+                        final String s = Double.toString(tData);
                         runOnUiThread(new Runnable() {
                             @Override
                             public void run() {
@@ -289,6 +365,47 @@ public class MainActivity extends AppCompatActivity {
                             }
                         });
                     }
+
+                    new AsyncTask<Void, Void, Void>() {
+                        @Override
+                        protected Void doInBackground(Void... param) {
+                            List<NameValuePair> params = new ArrayList<NameValuePair>(2);
+                            params.add(new BasicNameValuePair("temp",tempdata.toString()));
+                            params.add(new BasicNameValuePair("Light_sen",lightdata.toString()));
+
+                            android.os.Debug.waitForDebugger();
+                            // Creating service handler class instance
+
+
+
+                            ServiceHandler sh = new ServiceHandler();
+
+                            // Making a request to url and getting response
+                            String jsonStr = sh.makeServiceCall(url, ServiceHandler.POST, params);
+
+                            Log.d("Response: ", "> " + jsonStr);
+
+                            if (jsonStr != null)
+                            {
+                                try
+                                {
+                                    JSONObject jsonObj = new JSONObject(jsonStr);
+
+
+                                    Log.d("JSON", jsonObj.toString());
+
+
+
+                                } catch (JSONException e) {
+                                    e.printStackTrace();
+                                }
+                            } else
+                            {
+                                Log.e("ServiceHandler", "Couldn't get any data from the url");
+                            }
+                            return null;
+                        }
+                    };
                 }
             };
 
